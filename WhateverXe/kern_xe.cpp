@@ -211,6 +211,72 @@ static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_
  return ready;
 }
 
+// Victus fix: media contexts moved from fused-off VCS0 to VCS2 (see wrapTGLAcceleratorStart).
+static bool wexVCS2MediaReady=false;
+
+// Victus G5 diagnostics (read only): per-engine VCS interrupt and completion
+// counters, published live as ioreg WEXVCSDiag (40 x uint64):
+// [0] VCS dispatches [1] DW1 VCS0 [2] DW1 VCS2 [3..8] bitset bits 3,4,9,10,15,16
+// [9..16] IGScheduler5::notify type 0..7 [17..24] checkForProgress type 0..7
+// [25] CS5 enableStampInterrupt total [26] stamp 36..43 (VCS0) [27] stamp 44..51 (VCS2)
+// [28] VCS2 identity valid [29] VCS2 identity timeout [30] VCS0 valid [31] VCS0 timeout
+// [32] last VCS2 identity [33] last VCS0 identity [34] max polls used
+static mach_vm_address_t wexOrgVCSIRQ,wexOrgSchedNotify,wexOrgSchedProgress,wexOrgCSStamp;
+static uint64_t wexVCSDiag[40];
+static void wexDiagAdd(unsigned i) {__atomic_fetch_add(&wexVCSDiag[i],1ULL,__ATOMIC_RELAXED);}
+// Victus fix (r7): replaces IGInterruptBridge::readAndClearVCSInterrupts on
+// VCS2-only parts. The donor always selects VCS0 then VCS2 in IIR selector 1
+// and polls the identity only 11 times; VCS2 identities were never accepted.
+// Like i915, select only engines flagged in GT_INTR_DW1, wait up to ~100us
+// for the valid bit, map with the donor LUTs (VCS0 3/9/15, VCS2 4/10/16).
+static void wexVCSIRQ(void *bridge,uint64_t *bits,uint32_t dw) {
+	wexDiagAdd(0);if(dw&1)wexDiagAdd(1);if(dw&4)wexDiagAdd(2);
+	auto accel=bridge ? *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(bridge)+0x10) : nullptr;
+	auto mmio=accel ? *reinterpret_cast<volatile uint8_t **>(accel+0x1240) : nullptr;
+	if(!mmio || !bits)return;
+	auto reg=[mmio](uint32_t offset)->volatile uint32_t & {return *reinterpret_cast<volatile uint32_t *>(mmio+offset);};
+	struct Engine {uint32_t select,user,context,other,valid,timeout,last;};
+	const Engine engines[] {{1,3,9,15,30,31,33},{4,4,10,16,28,29,32}};
+	for(const auto &e:engines) {
+		if(!(dw&e.select))continue;
+		reg(0x190074)=e.select;
+		uint32_t identity=0,polls=0;
+		for(;polls<100;++polls) {
+			identity=reg(0x190064);
+			if(identity&0x80000000U)break;
+			IODelay(1);
+		}
+		if(polls>__atomic_load_n(&wexVCSDiag[34],__ATOMIC_RELAXED))__atomic_store_n(&wexVCSDiag[34],uint64_t(polls),__ATOMIC_RELAXED);
+		if(!(identity&0x80000000U)) {wexDiagAdd(e.timeout);continue;}
+		wexDiagAdd(e.valid);__atomic_store_n(&wexVCSDiag[e.last],uint64_t(identity),__ATOMIC_RELAXED);
+		auto set=[bits](uint32_t bit) {bits[bit>>6]|=1ULL<<(bit&63);};
+		if(identity&0x1)set(e.user);
+		if(identity&0x10)set(e.other);
+		if(identity&0x100)set(e.context);
+		reg(0x190064)=identity;
+	}
+	const unsigned seen[] {3,4,9,10,15,16};
+	if(bits)for(unsigned i=0;i<arrsize(seen);++i)if((bits[0]>>seen[i])&1)wexDiagAdd(3+i);
+}
+static uint64_t wexSchedNotify(void *s,uint32_t type) {
+	if(type<8)wexDiagAdd(9+type);
+	return FunctionCast(wexSchedNotify,wexOrgSchedNotify)(s,type);
+}
+static uint64_t wexSchedProgress(void *s,uint32_t type) {
+	if(type<8)wexDiagAdd(17+type);
+	return FunctionCast(wexSchedProgress,wexOrgSchedProgress)(s,type);
+}
+static uint64_t wexCSStamp(void *cs,int index) {
+	wexDiagAdd(25);if(index>=36 && index<44)wexDiagAdd(26);if(index>=44 && index<52)wexDiagAdd(27);
+	return FunctionCast(wexCSStamp,wexOrgCSStamp)(cs,index);
+}
+static bool wexVCSDiagSerialize(void *,void *,OSSerialize *serializer) {
+	uint64_t copy[arrsize(wexVCSDiag)];
+	for(unsigned i=0;i<arrsize(copy);++i)copy[i]=__atomic_load_n(&wexVCSDiag[i],__ATOMIC_RELAXED);
+	auto data=OSData::withBytes(copy,sizeof(copy));if(!data)return false;
+	const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 static bool xelpInstallNVRAMABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
     const auto os=XELP::kernelOS(version);
     if(os==XELP::OS::Unknown)return false;
@@ -4388,6 +4454,7 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+	XELP::adlpAllowVCS2Only=checkKernelArgument("-wex-adlp-allow-vcs2");
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -11650,6 +11717,68 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			ggttOK=ggttOK && reservedOK;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLGGTT64Writes",ggttOK);
 			patcher.clearError();
+			// Victus fix: PAVPCommandCallback trusts BIOS-locked PAVP bits in
+			// 0x1082C0, then uses the PAVP context at accel+0x1278. That context
+			// is not created here, so startGraphicsEngine faults at NULL+0xB8.
+			// Take the existing "PAVP disabled" branch (same target as je).
+			if (adlnDetected) {
+				const uint8_t find[] {0x80,0x3D,0x3C,0x1F,0x12,0x00,0x00,0x0F,0x84,0xDA,0x00,0x00,0x00};
+				const uint8_t replace[] {0x80,0x3D,0x3C,0x1F,0x12,0x00,0x00,0xE9,0xDB,0x00,0x00,0x00,0x90};
+				constexpr size_t window=0x180;
+				const auto callback=patcher.solveSymbol<mach_vm_address_t>(index,
+					"__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb",address,size);
+				patcher.clearError();
+				uint8_t *site=nullptr;unsigned hits=0;
+				if (callback>=address && callback+window<=address+size)
+					for (size_t o=0;o+sizeof(find)<=window;++o)
+						if (!memcmp(reinterpret_cast<const void *>(callback+o),find,sizeof(find))) {site=reinterpret_cast<uint8_t *>(callback+o);++hits;}
+				bool pavpOK=hits==1;
+				if (pavpOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					pavpOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXPAVPDisabledPath",pavpOK);
+				SYSLOG("igfx","PAVP disabled path hits=%u patched=%u",hits,pavpOK);
+			}
+			// Victus fix: on VCS2-only parts VCS0 has no command streamer, but the
+			// video media context params hardcode IGHwCsType 3 / instance 0. The
+			// donor already supports VCS2 (IGHwCsType 4, instance 2 => 0x1D0000).
+			if (adlnDetected && XELP::adlpVCS2OnlyAdmitted) {
+				const uint8_t find[] {3,0,8,0,1,0,0,0,0,0,0,0},replace[] {4,0,8,0,1,0,0,0,2,0,0,0};
+				constexpr size_t paramsOffset=0xBE8A0;
+				auto params=patcher.solveSymbol<mach_vm_address_t>(index,"__ZL34g_cInitGfxHwCtxParamsForVideoMedia",address,size);
+				patcher.clearError();
+				if (!params && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator19startGraphicsEngineEv",address,size)==address+0x25100)
+					params=address+paramsOffset;
+				patcher.clearError();
+				auto site=reinterpret_cast<uint8_t *>(params);
+				bool mediaOK=params>=address && params+sizeof(find)<=address+size && !memcmp(site,find,sizeof(find));
+				if (mediaOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					mediaOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+					patcher.clearError();
+				}
+				wexVCS2MediaReady=mediaOK;
+				if (mediaOK) {
+					KernelPatcher::RouteRequest diag[] {
+						{"__ZN17IGInterruptBridge25readAndClearVCSInterruptsER8IGBitSetILm46EEj",wexVCSIRQ,wexOrgVCSIRQ},
+						{"__ZN12IGScheduler56notifyE10IGHwCsType",wexSchedNotify,wexOrgSchedNotify},
+						{"__ZN12IGScheduler516checkForProgressE10IGHwCsType",wexSchedProgress,wexOrgSchedProgress},
+						{"__ZN26IGHardwareCommandStreamer520enableStampInterruptEi",wexCSStamp,wexOrgCSStamp}
+					};
+					const bool routed=patcher.routeMultiple(index,diag,arrsize(diag),address,size);
+					patcher.clearError();
+					IORegistryEntry::getRegistryRoot()->setProperty("WEXVCSDiagRouted",routed);
+					if (routed) if (auto live=OSSerializer::forTarget(nullptr,wexVCSDiagSerialize)) {
+						IORegistryEntry::getRegistryRoot()->setProperty("WEXVCSDiag",live);live->release();
+					}
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXVCS2Media",mediaOK);
+				SYSLOG("igfx","VCS2 media params patched=%u",mediaOK);
+			}
 
 			KernelPatcher::RouteRequest observations[] {
 				{"__ZN16IntelAccelerator5probeEP9IOServicePi", wrapTGLAcceleratorProbe, orgTGLAcceleratorProbe},
@@ -14481,7 +14610,14 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	// The current kernel personality uses 0x1080040, rejected by AppleGVA before
 	// AVD_CreateAVDAccelerator. The paired TGL VA donor returns 0x1080080.
 	// Align this registry identity only; keep the real PCI ID and TGL bundle.
-	if (auto renderer = OSDynamicCast(OSNumber, that->getProperty("IOVARendererID"))) {
+	// Victus fix: on VCS2-only parts without the VCS2 media patch keep the original
+	// ID so AppleGVA rejects hardware video, and drop the codec keys (software decode).
+	const bool videoOff=XELP::adlpVCS2OnlyAdmitted && !wexVCS2MediaReady;
+	that->setProperty("WEXHardwareVideoDisabled",videoOff);
+	if (videoOff) {
+		const char *keys[] {"IOGVACodec","IOGVAHEVCDecode","IOGVAHEVCDecodeCapabilities","IOGVAHEVCEncodeCapabilities","IOGVABGRAEnc","IOGVAScaler"};
+		for (auto key:keys) that->removeProperty(key);
+	} else if (auto renderer = OSDynamicCast(OSNumber, that->getProperty("IOVARendererID"))) {
 		if (renderer->unsigned32BitValue() == 0x1080040)
 			that->setProperty("IOVARendererID", 0x1080080, 32);
 	}
@@ -14490,7 +14626,7 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	// to the per-profile capability dictionary. The TGL personality has the
 	// dictionary but omits the key; use the paired ICL host's registration value.
 	// This exposes decode only and does not invent additional profile support.
-	if (!that->getProperty("IOGVAHEVCDecode") &&
+	if (!videoOff && !that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
 
